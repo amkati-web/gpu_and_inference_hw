@@ -1,108 +1,109 @@
 import torch
 
 
-# ============================================================================
-# Part 1: Implement PyTorch Functions
-# ============================================================================
-#
-# TASK 1a: Implement an operation with the lowest arithmetic intensity.
-# Use an op that performs essentially memory traffic with ~0 useful FLOPs
-# per element.
-
-
 def lowest_ai_fn(x: torch.Tensor) -> torch.Tensor:
     """Lowest arithmetic intensity baseline (0 FLOP/Byte)."""
-    # TODO (1 line): implement a lowest-AI op
-    pass
-
-
-# TASK 1b: Implement a function with configurable arithmetic intensity.
-# Build an element-wise compute operation where work increases with `num_ops`.
-# Design it so fused arithmetic intensity grows roughly linearly with `num_ops`,
-# while each element is still read/written once at the kernel boundary.
-# Return either the eager function or a compiled version depending on the
-# `compiled` flag so we can compare both on the roofline plot.
-#
-# Use an accumulator variable and implement fused multiply-add (FMA) style work
-# explicitly, e.g. `acc = acc * x + x`, so each loop iteration contributes
-# about 2 FLOPs per element in a realistic GPU-friendly pattern. We prefer this
-# pattern here mainly because it gives clean FLOP accounting and resembles the
-# kind of floating-point work GPUs are designed to do; Avoid patterns like repeated
-# doubling (`x = x + x`), since long self-dependent pointwise chains can trigger
-# very poor Inductor compile-time behavior and are also less useful for this
-# roofline exercise.
+    return x.clone()
 
 
 def make_compute_fn(num_ops: int, compiled: bool = True):
     """Return an eager or compiled function whose work scales with num_ops."""
-
     def fn(x: torch.Tensor) -> torch.Tensor:
-        pass
-
-    # TODO (1 line): return either `fn` or `torch.compile(fn)` based on `compiled`
-    pass
-
-
-# ============================================================================
-# Part 2: Benchmarking
-# ============================================================================
-#
-# TASK 2: Complete the benchmark function using CUDA events.
-# CUDA events measure GPU time precisely (not CPU wall time), which avoids
-# including kernel launch overhead or CPU-GPU synchronization delays.
+        acc = x.clone()
+        for _ in range(num_ops):
+            acc = acc * x + x
+        return acc
+    if compiled:
+        fn = torch.compile(fn)
+    return fn
 
 
 def benchmark_fn(fn, *args, warmup=25, rep=100) -> float:
     """Benchmark a GPU function using CUDA events.
-
     Returns median execution time in milliseconds.
     """
-    # Warmup (triggers torch.compile on first call, then warms caches)
     for _ in range(warmup):
         fn(*args)
     torch.cuda.synchronize()
 
-    # TODO: time `rep` runs using CUDA events and return median latency (ms)
-    pass
-
-
-# TASK 3: Compute element-wise operation metrics from measured runtime.
-# Count every arithmetic operation performed inside the loop (careful: each
-# `acc = acc * x + x` iteration does more than one FLOP per element).
-#
-# Use different byte-traffic models for the two variants:
-#   - compiled: assume the operation is fused, so each element is read once and
-#     written once at the kernel boundary
-#   - eager: estimate the traffic from the separate multiply and add operations
-#     launched by PyTorch in each loop iteration, including intermediate tensors
-#
-# Return a tuple with:
-#   - total_flops
-#   - arithmetic_intensity  (FLOP / Byte)
-#   - achieved_flops        (FLOP / s)
+    times = []
+    for _ in range(rep):
+        start = torch.cuda.Event(enable_timing=True)
+        end   = torch.cuda.Event(enable_timing=True)
+        start.record()
+        fn(*args)
+        end.record()
+        torch.cuda.synchronize()
+        times.append(start.elapsed_time(end))
+    return float(torch.tensor(times).median())
 
 
 def compute_elementwise_metrics(num_elements, num_ops, bytes_per_element, ms, variant):
-    # TODO: compute total FLOPs, arithmetic intensity, and achieved FLOP/s
-    pass
+    total_flops = 2 * num_ops * num_elements
+
+    if variant == "compiled":
+        total_bytes = 2 * num_elements * bytes_per_element
+    else:
+        total_bytes = (6 * num_ops + 2) * num_elements * bytes_per_element
+
+    ai = total_flops / total_bytes
+    achieved_flops = total_flops / (ms * 1e-3)
     return total_flops, ai, achieved_flops
 
 
 # ============================================================================
 # Part 3: Short Writeup
 # ============================================================================
-# Answer these after you generate `results/roofline.png` and inspect the points.
 #
-# Q1. Look at the compiled element-wise operations from `1 ops` through `64 ops`.
-# Why does performance rise as arithmetic intensity increases even though the
-# measured runtime changes only a little?
+# Q1. Why does performance rise as arithmetic intensity increases even though
+# the measured runtime changes only a little?
+# A1: Runtime stays nearly constant because the kernel remains memory-bound.
+# As num_ops grows, more FLOPs are done in the same time, so measured
+# FLOP/s rises even though the wall time barely changes.
 #
-# Q2. In one sample run, `matmul 1024x1024` achieved lower FLOP/s than the
-# `128 ops` compiled element-wise operation. Give one or two reasons why that can
-# happen on a large GPU like an H100.
+# Q2. Why did matmul 1024x1024 achieve lower FLOP/s than 128 ops compiled?
+# A2: A 1024x1024 matmul is too small to saturate all SMs on an L40S.
+# Launch overhead and poor occupancy reduce effective throughput.
 #
-# Q3. Between `64 ops` and `128 ops`, runtime increases more noticeably than it
-# did for smaller operations. What does that suggest about what resource is
-# becoming the bottleneck?
+# Q3. Why does runtime increase more noticeably between 64 and 128 ops?
+# A3: The kernel transitions from memory-bound to compute-bound.
+# Above 64 ops the ALUs become the bottleneck so runtime grows.
 #
-# Q4. Why do the eager `ops-K` points look so different from the compiled ones?
+# Q4. Why do eager ops-K points look so different from compiled ones?
+# A4: Eager mode materializes intermediates to HBM between every op,
+# inflating bytes moved and keeping AI very low regardless of num_ops.
+# Compiled mode fuses the loop so intermediates stay in registers.
+
+# ============================================================================
+# Part 3: Updated Writeup with Measured Data
+# ============================================================================
+#
+# Q1. Why does performance rise as arithmetic intensity increases even though
+# the measured runtime changes only a little?
+# A1: Runtime stays nearly constant (0.876ms to 0.882ms across all compiled
+# runs from 1 ops to 128 ops). As num_ops grows from 1 to 128, AI rises
+# from 0.25 to 32 FLOP/B and TFLOP/s rises from 0.15 to 19.47 — all while
+# wall time barely moves. The kernel is memory-bound so the GPU finishes
+# compute while waiting for the next memory transfer.
+#
+# Q2. Why did matmul 1024x1024 achieve lower FLOP/s than 128 ops compiled?
+# A2: matmul 1024x1024 achieved 23.03 TFLOP/s on our L40S run, which is
+# actually slightly above 128 ops compiled (19.47 TFLOP/s). However small
+# matmuls underperform because the 1024x1024 problem is too small to keep
+# all SMs busy — poor occupancy and kernel launch overhead dominate.
+# Larger matmuls (2048: 40.50, 4096: 36.17 TFLOP/s) show this clearly.
+#
+# Q3. Why does runtime increase more noticeably between 64 and 128 ops?
+# A3: Measured compiled runtime stays flat at ~0.88ms all the way to 128
+# ops — the L40S ridge point is 106 FLOP/B but compiled AI only reaches
+# 32 FLOP/B at 128 ops. The kernel is still memory-bound at these sizes
+# so compute is not yet the bottleneck. Larger num_ops would eventually
+# cross the ridge and show runtime growth.
+#
+# Q4. Why do eager ops-K points look so different from compiled ones?
+# A4: Eager runtime grows linearly with num_ops (3.3ms at 1 op to 325ms
+# at 128 ops) while AI stays stuck at ~0.08 FLOP/B the whole time.
+# Each multiply and add launches a separate kernel, writing intermediates
+# to HBM every iteration — bytes explode while FLOPs stay the same.
+# Compiled fuses everything into one kernel: runtime flat at ~0.88ms
+# while AI grows from 0.25 to 32 FLOP/B, moving rightward on the roofline.
